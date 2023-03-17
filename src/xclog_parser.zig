@@ -4,13 +4,13 @@ const xclog = @import("xcactivitylog.zig");
 
 const SwiftcInfo = struct { swift_files: []const []const u8, swift_filelists: []const []const u8, module_name: []const u8, index_store_path: []const u8 };
 
-fn extract_infos_from_swiftc(command: []const u8) !SwiftcInfo {
+fn extractInfosFromSwiftc(command: []const u8) !SwiftcInfo {
     const args = try shlx.split(command);
     var module_name: []u8 = undefined;
     var index_store_path: []u8 = undefined;
     var swift_files = std.ArrayList([]u8).init(std.heap.c_allocator);
     var swift_filelists = std.ArrayList([]u8).init(std.heap.c_allocator);
-    for (args) |arg, i| {
+    for (args, 0..) |arg, i| {
         if (std.mem.startsWith(u8, arg, "-module-name")) {
             module_name = args[i + 1];
         } else if (std.mem.startsWith(u8, arg, "-index-store-path")) {
@@ -37,19 +37,24 @@ test "extract from swiftc" {
         .module_name = "b",
         .index_store_path = "c",
     };
-    const actual = try extract_infos_from_swiftc(input);
+    const actual = try extractInfosFromSwiftc(input);
     try std.testing.expectEqualSlices(u8, expected.swift_filelists[0], actual.swift_filelists[0]);
     try std.testing.expectEqualSlices(u8, expected.swift_files[0], actual.swift_files[0]);
     try std.testing.expectEqualSlices(u8, expected.module_name, actual.module_name);
     try std.testing.expectEqualSlices(u8, expected.index_store_path, actual.index_store_path);
 }
 
-const Swiftc = struct {
+pub const Swiftc = struct {
     directory: []const u8,
     command: []const u8,
     module_name: []const u8,
     files: []const []const u8,
-    filelists: []const []const u8,
+    fileLists: []const []const u8,
+
+    pub fn identifier(self: Swiftc) []const u8 {
+        if (self.module_name.len > 0) return self.module_name;
+        return "";
+    }
 };
 
 const XcodeLogParser = struct {
@@ -59,7 +64,7 @@ const XcodeLogParser = struct {
         return XcodeLogParser{ .index_store_path = std.StringHashMap(void).init(std.heap.c_allocator) };
     }
 
-    fn parse_swiftc(self: *XcodeLogParser, input: []const []const u8) ?Swiftc {
+    fn parseSwiftc(self: *XcodeLogParser, input: []const []const u8) ?Swiftc {
         const line = input[0];
         if (!std.mem.startsWith(u8, line, "CompileSwiftSources ")) return null;
         const command = input[input.len - 1];
@@ -72,7 +77,7 @@ const XcodeLogParser = struct {
                 break;
             }
         }
-        const info = extract_infos_from_swiftc(command) catch return null;
+        const info = extractInfosFromSwiftc(command) catch return null;
         if (info.swift_filelists.len > 0) {
             self.index_store_path.put(info.module_name, {}) catch return null;
         }
@@ -81,11 +86,11 @@ const XcodeLogParser = struct {
             .command = command,
             .module_name = info.module_name,
             .files = info.swift_files,
-            .filelists = info.swift_filelists,
+            .fileLists = info.swift_filelists,
         };
     }
 
-    fn parse_swift_driver(self: *XcodeLogParser, input: []const []const u8) ?Swiftc {
+    fn parseSwiftDriver(self: *XcodeLogParser, input: []const []const u8) ?Swiftc {
         const line = input[0];
         if (!std.mem.startsWith(u8, line, "SwiftDriver")) return null;
         var command = input[input.len - 1];
@@ -103,7 +108,7 @@ const XcodeLogParser = struct {
                 break;
             }
         }
-        const info = extract_infos_from_swiftc(command) catch return null;
+        const info = extractInfosFromSwiftc(command) catch return null;
         if (info.swift_filelists.len > 0) {
             self.index_store_path.put(info.module_name, {}) catch return null;
         }
@@ -112,12 +117,12 @@ const XcodeLogParser = struct {
             .command = command,
             .module_name = info.module_name,
             .files = info.swift_files,
-            .filelists = info.swift_filelists,
+            .fileLists = info.swift_filelists,
         };
     }
 
     fn parse(self: *XcodeLogParser, input: []const []const u8) !Swiftc {
-        return self.parse_swiftc(input) orelse self.parse_swift_driver(input) orelse return error.InvalidMacher;
+        return self.parseSwiftc(input) orelse self.parseSwiftDriver(input) orelse return error.InvalidMacher;
     }
 };
 
@@ -131,13 +136,13 @@ pub fn parse(path: []const u8) ![]Swiftc {
     var parser = XcodeLogParser.init();
     var infos = std.ArrayList(Swiftc).init(std.heap.c_allocator);
 
-    var logs = try xclog.extract_compile_log(content);
+    var logs = try xclog.extractCompileLog(content);
 
     for (logs) |log| {
         var splitter = std.mem.split(u8, log, "\r");
         var lines = std.ArrayList([]const u8).init(std.heap.c_allocator);
         while (splitter.next()) |line| {
-            var l = std.mem.trim(u8, line, " ");
+            var l = std.mem.trim(u8, line, &std.ascii.whitespace);
             if (l.len > 0) try lines.append(l);
         }
         if (lines.items.len <= 1) {
@@ -147,7 +152,7 @@ pub fn parse(path: []const u8) ![]Swiftc {
         var info = parser.parse(try lines.toOwnedSlice()) catch continue;
         // std.debug.print("module_name: {s}\n", .{info.module_name});
         // std.debug.print("directory: {s}\n", .{info.directory});
-        // std.debug.print("filelists: {d}\n", .{info.filelists.len});
+        // std.debug.print("filelists: {d}\n", .{info.fileLists.len});
         try infos.append(info);
     }
 
@@ -157,5 +162,7 @@ pub fn parse(path: []const u8) ![]Swiftc {
 test "parse xclog" {
     const path = "/Users/miloas/Library/Developer/Xcode/DerivedData/final_input-begpicrvpfuaetexncumwacqbywz/Logs/Build/39932C67-9BAD-4F3E-B17C-2410AF4DC667.xcactivitylog";
     const infos = try parse(path);
+    // const stdOut = std.io.getStdOut();
+    // try std.json.stringify(infos, .{ .whitespace = .{ .indent = .Tab } }, stdOut.writer());
     try std.testing.expect(infos.len > 0);
 }

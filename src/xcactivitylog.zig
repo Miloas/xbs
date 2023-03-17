@@ -96,7 +96,7 @@ pub fn tokenize(content: []const u8) ![][]const u8 {
     return tokens;
 }
 
-pub fn extract_compile_log(content: []const u8) ![][]const u8 {
+pub fn extractCompileLog(content: []const u8) ![][]const u8 {
     var tokenizer = try Tokenizer.init(content);
     var logs = std.ArrayList([]const u8).init(std.heap.c_allocator);
     while (true) {

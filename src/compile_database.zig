@@ -161,10 +161,10 @@ const CompilationDatabase = struct {
     fl: Filelists,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.allocator) CompilationDatabase {
+    pub fn init(allocator: std.mem.Allocator) CompilationDatabase {
         return CompilationDatabase{
-            .cache = std.StringHashMap([]const u8).init(std.heap.c_allocator),
-            .fl = Filelists.init(),
+            .cache = std.StringHashMap([]const u8).init(allocator),
+            .fl = Filelists.init(allocator),
             .allocator = allocator,
         };
     }
@@ -174,11 +174,11 @@ const CompilationDatabase = struct {
             const compile_file = try std.fs.openFileAbsolute(compile_file_path, .{ .mode = .read_only });
             defer compile_file.close();
             const stat = try compile_file.stat();
-            const buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-            // TODO: using arena
-            const contents = try compile_file.readToEndAlloc(std.heap.c_allocator, stat.size);
-            const token_stream = std.json.TokenStream.init(contents);
-            const items = try std.json.parse([]Swiftc, &token_stream, .{});
+            const contents = try compile_file.readToEndAlloc(self.allocator, stat.size);
+            var token_stream = std.json.TokenStream.init(contents);
+
+            const parse_options = std.json.ParseOptions{ .allocator = self.allocator, .ignore_unknown_fields = true };
+            const items = try std.json.parse([]Swiftc, &token_stream, parse_options);
             errdefer std.json.parseFree([]Swiftc, items, .{});
 
             for (items) |item| {
@@ -186,13 +186,14 @@ const CompilationDatabase = struct {
                 if (command.len == 0) continue;
                 var files = item.files;
                 for (files) |file| {
-                    var realpath = try std.fs.realpath(file, &buffer);
-                    realpath = try trans2Lowercase(realpath);
-                    try self.cache.put(realpath, command);
+                    var realpath = try std.fs.realpathAlloc(self.allocator, file);
+                    const path = try trans2Lowercase(realpath);
+                    try self.cache.put(path, command);
                 }
-                files = try self.fl.get_files(item.filelists);
+                files = try self.fl.get_files(item.fileLists);
                 for (files) |file| {
-                    try self.cache.put(file, command);
+                    const path = try trans2Lowercase(file);
+                    try self.cache.put(path, command);
                 }
             }
         }
@@ -201,18 +202,18 @@ const CompilationDatabase = struct {
     }
 
     fn filterFlags(self: *CompilationDatabase, flags: []const []const u8) ![]const []const u8 {
-        var ret = std.ArrayList([]const u8).init(std.heap.c_allocator);
+        var ret = std.ArrayList([]const u8).init(self.allocator);
         var i: usize = 0;
         while (i < flags.len) {
             const flag = flags[i];
             i += 1;
             if (std.mem.eql(u8, flag, "-use-frontend-parseable-output")) continue;
             if (std.mem.eql(u8, flag, "-filelist")) {
-                _ = try self.fl.get_files(flags[i]);
+                _ = try self.fl.get_files(&[_][]const u8{flags[i]});
                 i += 1;
                 continue;
             }
-            ret.append(flag);
+            try ret.append(flag);
         }
         return try ret.toOwnedSlice();
     }
@@ -230,3 +231,15 @@ const CompilationDatabase = struct {
         return .{ .flags = flags, .do_cache = true };
     }
 };
+
+test "get flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var db = CompilationDatabase.init(arena.allocator());
+    const ret = try db.getFlags("/Users/miloas/Desktop/final input/final input/ContentView.swift", "/Users/miloas/Desktop/final input/.compile");
+    // std.debug.print("len: {d}\n", .{ret.flags.len});
+    // for (ret.flags) |f| {
+    //     std.debug.print("flag: {s}\n", .{f});
+    // }
+    try std.testing.expect(ret.flags.len > 0);
+}

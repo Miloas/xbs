@@ -155,7 +155,7 @@ const Filelists = struct {
 //     }
 // }
 
-const CompilationDatabase = struct {
+pub const CompilationDatabase = struct {
     // filename -> command
     cache: std.StringHashMap([]const u8),
     fl: Filelists,
@@ -175,18 +175,21 @@ const CompilationDatabase = struct {
             defer compile_file.close();
             const stat = try compile_file.stat();
             const contents = try compile_file.readToEndAlloc(self.allocator, stat.size);
+            defer self.allocator.free(contents);
             var token_stream = std.json.TokenStream.init(contents);
 
             const parse_options = std.json.ParseOptions{ .allocator = self.allocator, .ignore_unknown_fields = true };
             const items = try std.json.parse([]Swiftc, &token_stream, parse_options);
-            errdefer std.json.parseFree([]Swiftc, items, .{});
+            defer std.json.parseFree([]Swiftc, items, parse_options);
 
             for (items) |item| {
-                const command = item.command;
+                var command = try self.allocator.alloc(u8, item.command.len);
+                std.mem.copy(u8, command, item.command);
                 if (command.len == 0) continue;
                 var files = item.files;
                 for (files) |file| {
                     var realpath = try std.fs.realpathAlloc(self.allocator, file);
+                    defer self.allocator.free(realpath);
                     const path = try trans2Lowercase(realpath);
                     try self.cache.put(path, command);
                 }

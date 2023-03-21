@@ -1,5 +1,6 @@
 const std = @import("std");
 const URI = @import("uri.zig");
+const cdb = @import("compile_database.zig");
 const BuildServerConfig = @import("config.zig").BuildServerConfig;
 
 const BuildClientCapabilities = struct {
@@ -27,6 +28,13 @@ const InitializeBuildResult = struct { displayName: []const u8, version: []const
     indexDatabasePath: []const u8,
     indexStorePath: []const u8,
 } };
+
+const RegisterForChangesRequestMessage = struct {
+    jsonrpc: []const u8,
+    id: u32,
+    method: []const u8,
+    params: struct { uri: []const u8, action: []const u8 },
+};
 
 fn expandUser(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
     if (std.fs.path.isAbsolute(path)) {
@@ -56,16 +64,27 @@ fn expandUser(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
 //     try std.testing.expectEqualSlices(u8, "/Users/miloas/123", a3);
 // }
 
+fn send(msg: []const u8) !void {
+    var stdout = std.io.getStdOut().writer();
+    var buffered_writer = std.io.bufferedWriter(stdout);
+    const stdout_writer = buffered_writer.writer();
+    try stdout_writer.print("Content-Length: {d}\r\n\r\n", .{msg.len});
+    try stdout_writer.writeAll(msg);
+    try buffered_writer.flush();
+}
+
 const BuildServer = struct {
     const method_map = .{.{ "build/initialize", initializeHandler }};
 
     allocator: std.mem.Allocator,
     compile_path: []const u8,
+    db: cdb.CompilationDatabase,
 
     fn init(allocator: std.mem.Allocator) !BuildServer {
         return BuildServer{
             .allocator = allocator,
             .compile_path = "",
+            .db = cdb.CompilationDatabase.init(allocator),
         };
     }
 
@@ -122,43 +141,150 @@ const BuildServer = struct {
         const index_database_path = try std.fs.path.join(self.allocator, &[_][]const u8{ cache_path, "indexDatabasePath" });
         defer self.allocator.free(index_database_path);
 
-        const stdout = std.io.getStdOut().writer();
-        try stdout.writeAll(
+        var buffer = std.ArrayListUnmanaged(u8){};
+        var writer = buffer.writer(self.allocator);
+        try writer.writeAll(
             \\{"jsonrpc":"2.0",
         );
-        try stdout.print(
+        try writer.print(
             \\"id":{d},
         , .{request_message.id});
-        try stdout.writeAll(
+        try writer.writeAll(
             \\"result":{
         );
-        try stdout.writeAll(
+        try writer.writeAll(
             \\"displayName":"xbs",
             \\"version":"0.1",
             \\"bspVersion":"2.0",
         );
-        try stdout.print(
+        try writer.print(
             \\"rootUri":"{s}",
         , .{root_uri});
-        try stdout.writeAll(
+        try writer.writeAll(
             \\"capabilities":{
             \\"languageIds":["c","cpp","objective-c","objective-cpp","swift"]
             \\},
             \\"data":{
         );
-        try stdout.print(
+        try writer.print(
             \\"indexDatabasePath":"{s}",
         , .{index_database_path});
-        try stdout.print(
+        try writer.print(
             \\"indexStorePath":"{s}"
         , .{index_store_path});
-        try stdout.writeAll(
+        try writer.writeAll(
             \\}}}
         );
+
+        const message = try buffer.toOwnedSlice(self.allocator);
+        defer self.allocator.free(message);
+        try send(message);
+    }
+
+    fn registerForChangesHandler(self: *BuildServer, request_message: RegisterForChangesRequestMessage) !void {
+        var buffer = std.ArrayListUnmanaged(u8){};
+        var writer = buffer.writer(self.allocator);
+        try writer.writeAll(
+            \\{"jsonrpc":"2.0",
+        );
+        try writer.print("id:{d},", .{request_message.id});
+        try writer.writeAll(
+            \\"result":null}
+        );
+
+        const response_msg = try buffer.toOwnedSlice(self.allocator);
+        defer self.allocator.free(response_msg);
+        try send(response_msg);
+
+        if (std.mem.eql(u8, request_message.params.action, "register")) {
+            const uri = request_message.params.uri;
+            try writer.writeAll(
+                \\{"jsonrpc":"2.0",
+            );
+            try writer.writeAll(
+                \\"method":"build/sourceKitOptionsChanged",
+            );
+            try writer.writeAll(
+                \\"params":{
+            );
+            try writer.print(
+                \\"uri":"{s}",
+            , .{uri});
+
+            const update_options = try self.optionsForFile(uri);
+            try writer.writeAll(
+                \\"updateOptons":{
+            );
+            try writer.writeAll(
+                \\"options":[
+            );
+            if (update_options.options.len > 0) {
+                try writer.print(
+                    \\"{s}"
+                , .{update_options.options[0]});
+            }
+            if (update_options.options.len > 1) {
+                for (update_options.options[1..]) |option| {
+                    try writer.print(
+                        \\",{s}"
+                    , .{option});
+                }
+            }
+            try writer.writeAll(
+                \\],
+            );
+            try writer.print(
+                \\"workingDirectory":"{s}"
+            , .{update_options.working_directory});
+            try writer.writeAll(
+                \\}}
+            );
+            const notification_msg = try buffer.toOwnedSlice(self.allocator);
+            defer self.allocator.free(notification_msg);
+            try send(notification_msg);
+        }
+    }
+
+    fn optionsForFile(self: *BuildServer, uri: []const u8) !struct { options: []const []const u8, working_directory: []const u8 } {
+        self.compile_path = "/Users/miloas/Desktop/final input/.compile";
+        const file_path = try URI.parse(self.allocator, uri);
+        defer self.allocator.free(file_path);
+        const flags = (try self.db.getFlags(file_path, self.compile_path)).flags;
+        var workdir: []const u8 = "";
+        for (flags, 0..) |flag, i| {
+            if (std.mem.eql(u8, flag, "-working-directory")) {
+                workdir = flags[i + 1];
+                break;
+            }
+        }
+        if (workdir.len == 0) {
+            var cwd_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+            workdir = try std.os.getcwd(&cwd_buf);
+        }
+        return .{
+            .options = flags,
+            .working_directory = workdir,
+        };
     }
 };
 
-// test "build server init" {
+// test "build server register for changes handler" {
+//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+//     defer arena.deinit();
+//     var server = try BuildServer.init(arena.allocator());
+//     const request_msg = RegisterForChangesRequestMessage{
+//         .jsonrpc = "2.0",
+//         .id = 1,
+//         .method = "build/registerForChanges",
+//         .params = .{
+//             .action = "register",
+//             .uri = "file:///Users/miloas/Desktop/final input/final input/ContentView.swift",
+//         },
+//     };
+//     try server.registerForChangesHandler(request_msg);
+// }
+
+// test "build server init handler" {
 //     var server = try BuildServer.init(std.testing.allocator);
 //     const request_msg = InitializeBuildRequestMessage{
 //         .jsonrpc = "2.0",
